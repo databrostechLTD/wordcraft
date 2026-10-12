@@ -4,8 +4,16 @@
 FROM rust:1-bookworm AS build
 ARG APP=wordcraft-web
 
-RUN rustup target add wasm32-unknown-unknown \
- && cargo install --locked trunk
+# Keep peak memory low so the build is not OOM-killed (exit 137) on small build
+# servers: compile one crate at a time and drop debug info.
+ENV CARGO_BUILD_JOBS=1 \
+    CARGO_INCREMENTAL=0 \
+    CARGO_PROFILE_RELEASE_DEBUG=false
+
+# Prebuilt Trunk binary (avoids compiling Trunk from source).
+RUN curl -fsSL https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-unknown-linux-gnu.tar.gz \
+      | tar -xzf - -C /usr/local/bin trunk \
+ && rustup target add wasm32-unknown-unknown
 
 WORKDIR /src
 COPY . .
