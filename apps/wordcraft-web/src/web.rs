@@ -50,17 +50,30 @@ pub fn start() {
                     if let Err(e) = listen_for_pasted_pictures(inbox.clone(), cc.egui_ctx.clone()) {
                         log::error!("pasting pictures is unavailable: {e}");
                     }
+                    // An embedding host (e.g. the Nexa app) hands documents in and takes saves out over postMessage.
+                    if let Err(e) = listen_for_host_messages(inbox.clone(), cc.egui_ctx.clone()) {
+                        log::error!("host messaging is unavailable: {e}");
+                    }
+                    let embedded = query().contains("embedded");
                     let doc = if query().contains("sample") { wordcraft_engine::sample::sample_document() } else { wordcraft_doc::Document::new() };
-                    let mut app = WordApp::new(Session::new(doc), services(inbox.clone(), cc.egui_ctx.clone(), dirty));
+                    let mut app = WordApp::new(Session::new(doc), services(inbox.clone(), cc.egui_ctx.clone(), dirty, embedded));
                     app.autosave = false;
                     Ok(Box::new(WebShell { app, inbox }))
                 }),
             )
             .await;
-        if let Some(el) = document.get_element_by_id(LOADING_ID) {
-            match result {
-                Ok(()) => el.remove(),
-                Err(e) => el.set_inner_html(&format!("<p>WordCraft failed to start: {e:?}</p><p>A browser with WebGPU or WebGL2 is required.</p>")),
+        match result {
+            Ok(()) => {
+                if let Some(el) = document.get_element_by_id(LOADING_ID) {
+                    el.remove();
+                }
+                // Tell the embedding host we are ready to receive a document.
+                post_to_host("editor:ready", None, &[]);
+            }
+            Err(e) => {
+                if let Some(el) = document.get_element_by_id(LOADING_ID) {
+                    el.set_inner_html(&format!("<p>WordCraft failed to start: {e:?}</p><p>A browser with WebGPU or WebGL2 is required.</p>"));
+                }
             }
         }
     });
@@ -152,8 +165,62 @@ fn listen_for_pasted_pictures(inbox: Inbox, ctx: egui::Context) -> Result<(), St
     Ok(())
 }
 
+/// Largest document accepted from the embedding host, as a sanity cap.
+const MAX_HOST_DOC_BYTES: u32 = 200u32 << 20;
+
+/// An embedding host (such as the Nexa app) hands a document in and takes saves out over
+/// `window.postMessage`. The host waits for an `editor:ready` message, then posts
+/// `{ type: "editor:open", name, bytes }`, where `bytes` is an `ArrayBuffer` or `Uint8Array`.
+fn listen_for_host_messages(inbox: Inbox, ctx: egui::Context) -> Result<(), String> {
+    let window = web_sys::window().ok_or("no window")?;
+    let on_message = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |e: web_sys::MessageEvent| {
+        let data = e.data();
+        let kind = js_sys::Reflect::get(&data, &wasm_bindgen::JsValue::from_str("type")).ok().and_then(|v| v.as_string()).unwrap_or_default();
+        if kind != "editor:open" {
+            return;
+        }
+        let name = js_sys::Reflect::get(&data, &wasm_bindgen::JsValue::from_str("name")).ok().and_then(|v| v.as_string()).unwrap_or_else(|| "document".into());
+        let Ok(bytes_val) = js_sys::Reflect::get(&data, &wasm_bindgen::JsValue::from_str("bytes")) else {
+            return;
+        };
+        if bytes_val.is_undefined() || bytes_val.is_null() {
+            return;
+        }
+        let array = js_sys::Uint8Array::new(&bytes_val);
+        if array.length() == 0 || array.length() > MAX_HOST_DOC_BYTES {
+            return;
+        }
+        inbox.lock().unwrap_or_else(|e| e.into_inner()).push((name, array.to_vec()));
+        ctx.request_repaint();
+    });
+    window.add_event_listener_with_callback("message", on_message.as_ref().unchecked_ref()).map_err(|e| format!("{e:?}"))?;
+    on_message.forget();
+    Ok(())
+}
+
+/// Post a message to the embedding host (the parent window). When `bytes` is non-empty it is sent
+/// as a `Uint8Array` under `bytes`, with the last component of `path` under `name`.
+fn post_to_host(kind: &str, path: Option<&str>, bytes: &[u8]) {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let Ok(Some(parent)) = window.parent() else {
+        return;
+    };
+    let obj = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(&obj, &wasm_bindgen::JsValue::from_str("type"), &wasm_bindgen::JsValue::from_str(kind));
+    if let Some(path) = path {
+        let name = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "document".into());
+        let _ = js_sys::Reflect::set(&obj, &wasm_bindgen::JsValue::from_str("name"), &wasm_bindgen::JsValue::from_str(&name));
+    }
+    if !bytes.is_empty() {
+        let _ = js_sys::Reflect::set(&obj, &wasm_bindgen::JsValue::from_str("bytes"), &js_sys::Uint8Array::from(bytes));
+    }
+    let _ = parent.post_message(&obj, "*");
+}
+
 /// `dirty` is the flag the `beforeunload` guard reads ([`guard_unload`]).
-fn services(inbox: Inbox, ctx: egui::Context, dirty: Rc<Cell<bool>>) -> Services {
+fn services(inbox: Inbox, ctx: egui::Context, dirty: Rc<Cell<bool>>, embedded: bool) -> Services {
     let open_inbox = inbox.clone();
     Services {
         open_async: Some(Box::new(move |purpose: &str| {
@@ -179,7 +246,15 @@ fn services(inbox: Inbox, ctx: egui::Context, dirty: Rc<Cell<bool>>) -> Services
         })),
         // Exports ask for a name; the browser decides where the download goes.
         pick_save: Some(Box::new(|name: &str| Some(name.to_string()))),
-        download: Some(Box::new(download)),
+        download: Some(Box::new(move |path: &str, bytes: &[u8]| {
+            if embedded {
+                // Embedded: hand the saved file back to the host instead of downloading it.
+                post_to_host("editor:saved", Some(path), bytes);
+                Ok(())
+            } else {
+                download(path, bytes)
+            }
+        })),
         print: Some(Box::new(print_pdf)),
         inbox: Some(inbox),
         on_dirty: Some(Box::new(move |d| dirty.set(d))),
